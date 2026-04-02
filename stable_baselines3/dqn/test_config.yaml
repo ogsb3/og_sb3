@@ -1,0 +1,54 @@
+# Environment configuration
+env:
+  id: "SeaquestNoFrameskip-v4"
+  n_envs: 10  # parallel environments within each training run
+  n_stack: 4
+  atari: True
+
+# Hardware configuration
+hardware:
+  n_gpus: 1  # will distribute the 4 runs across 2 GPUs
+  max_processes: 4  # all 4 runs happen simultaneously
+
+# Training configuration
+training:
+  total_timesteps: 10000000
+  configurations:
+    - dqn_baseline  # only one configuration name
+  seeds:
+    - 42    # seed 1
+    - 123   # seed 2
+    - 456   # seed 3
+    - 789   # seed 4
+
+# Logging configuration
+logging:
+  log_dir: "./Sea_logs"
+  run_tag: "Sea_ddqn"
+  eval_freq: 10000
+  n_eval_episodes: 10
+  save_freq: 5000
+  keep_checkpoints: 5
+  verbose: 1
+  progress_bar: true
+  model_save_freq: 0
+  save_buffer: True
+  format:
+    - stdout
+    - csv
+    - tensorboard
+
+# DQN configuration
+dqn_baseline:
+  algorithm: "dqn"
+  params:
+    learning_rate: 0.0001
+    buffer_size: 10000
+    learning_starts: 100000
+    batch_size: 32
+    gamma: 0.99
+    train_freq: 4
+    gradient_steps: 1
+    target_update_interval: 1000
+    exploration_fraction: 0.1
+    exploration_final_eps: 0.01
