@@ -1,13 +1,14 @@
 import os
 import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import yaml
 import argparse
 from typing import Dict, Any, List
+import ale_py
 import gymnasium as gym
 import numpy as np
-from stable_baselines3 import DQN, DRBS, DGPI
-from stable_baselines3.drbs import DRBS2
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, MetricsCallback, ModelSaveCallback
+from stable_baselines3.dqn.dqn import DQN
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, CallbackList
 from stable_baselines3.common.vec_env import VecFrameStack, DummyVecEnv, VecTransposeImage
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.monitor import Monitor
@@ -19,25 +20,28 @@ import logging
 from pathlib import Path
 
 
-def make_env(env_id: str, rank: int, seed: int = 0, monitor_dir: str = None):
+def make_env(env_id: str, rank: int, seed: int = 0, monitor_dir: str = None, atari: bool = False):
     def _init():
-        env = gym.make(env_id)
-        env = AtariWrapper(env)
+        env = AtariWrapper(gym.make(env_id)) if atari else gym.make(env_id)
         if monitor_dir:
             env = Monitor(env, os.path.join(monitor_dir, str(rank)))
-        env.seed(seed + rank)
+        env.reset(seed=seed+rank)
         return env
     return _init
 
 def setup_env(config: Dict[str, Any], seed: int, monitor_dir: str = None):
     env_id = config['env']['id']
     n_envs = config['env']['n_envs']
+    atari = config['env']['atari']
     
     env = DummyVecEnv([
-        make_env(env_id, i, seed, monitor_dir) 
+        make_env(env_id, i, seed, monitor_dir, atari) 
         for i in range(n_envs)
     ])
-    env = VecFrameStack(env, n_stack=config['env']['n_stack'])
+
+    stack = config['env']['n_stack']
+    if stack != 0 :
+        env = VecFrameStack(env, n_stack=stack)
     
     return env
 
@@ -87,12 +91,10 @@ def train_single_run(
 
     env = setup_env(config, seed, train_monitor_dir)
     eval_env = setup_env(config, seed + 1000, eval_monitor_dir)
-    eval_env = VecTransposeImage(eval_env)
+    eval_env = VecTransposeImage(eval_env) if config['env']['atari'] else eval_env
     
-    # Setup callbacks
-    metrics_callback = MetricsCallback()
 
-    actual_eval_freq = config['logging']['eval_freq'] // config['env']['n_envs']
+    actual_eval_freq = config['logging']['eval_freq'] // config['env'].get('n_envs', 1)
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=run_dir,
@@ -101,14 +103,22 @@ def train_single_run(
         n_eval_episodes=config['logging']['n_eval_episodes'],
         deterministic=True,
         verbose=config['logging'].get('verbose', 0),
-        tag=f"{config['logging'].get('run_tag', 'default')}_{config_name}_{seed}"
+        #tag=f"{config['logging'].get('run_tag', 'default')}_{config_name}_{seed}"
     )
 
-    model_save_callback = ModelSaveCallback(
-        save_freq=config['logging']['save_freq'],
-        save_path=run_dir,
-        keep_checkpoints=config['logging']['keep_checkpoints']
-    )
+    if config['logging']['model_save_freq'] != 0:
+        actual_model_save_freq = config['logging']['model_save_freq'] // config['env'].get('n_envs', 1) 
+        checkpoint_callback = CheckpointCallback(
+            save_freq=actual_model_save_freq,
+            save_replay_buffer=config['logging']['save_buffer'],
+            save_path=run_dir,
+            name_prefix="check_dip",
+        )
+
+        callbacks = CallbackList([checkpoint_callback, eval_callback])
+    
+    else: callbacks = eval_callback
+
     
     # Configure SB3 logger with specified formats
     new_logger = configure(
@@ -118,33 +128,34 @@ def train_single_run(
     
     # Initialize algorithm
     algo_type = config[config_name]['algorithm']
-    algo_class = {"dqn": DQN, "drbs": DRBS, "drbs2": DRBS2, "dgpi": DGPI}[algo_type]
+    algo_class = {"dqn": DQN}[algo_type]
 
     tag = f"{config['logging'].get('run_tag', 'default')}_{config_name}_{seed}"
 
     model_params = config[config_name]['params']
 
     # Only add EvalCallback if the algorithm is not DGPI
-    callbacks = [] #metrics_callback
-    if algo_type != "dgpi":
-        actual_eval_freq = config['logging']['eval_freq'] // config['env'].get('n_envs', 1)
-        eval_callback = EvalCallback(
-            eval_env,
-            best_model_save_path=run_dir,
-            log_path=run_dir,
-            eval_freq=actual_eval_freq,
-            n_eval_episodes=config['logging']['n_eval_episodes'],
-            deterministic=True,
-            verbose=config['logging'].get('verbose', 0),
-            tag=tag
-        )
-        callbacks.append(eval_callback)
-    else:
-        model_params['tag'] = tag
-        model_params['eval_env'] = eval_env
+    # callbacks = [] #metrics_callback
+    # if algo_type != "dgpi":
+    #     actual_eval_freq = config['logging']['eval_freq'] // config['env'].get('n_envs', 1)
+    #     eval_callback = EvalCallback(
+    #         eval_env,
+    #         best_model_save_path=run_dir,
+    #         log_path=run_dir,
+    #         eval_freq=actual_eval_freq,
+    #         n_eval_episodes=config['logging']['n_eval_episodes'],
+    #         deterministic=True,
+    #         verbose=config['logging'].get('verbose', 0),
+    #         #tag=tag
+    #     )
+    #     callbacks.append(eval_callback)
+    # else:
+    #     model_params['tag'] = tag
+    #     model_params['eval_env'] = eval_env
 
 
     model = algo_class(
+        policy="CnnPolicy" if config['env']['atari'] else "MlpPolicy",
         env=env,
         verbose=config['logging'].get('verbose', 0),
         seed=seed,
@@ -155,9 +166,7 @@ def train_single_run(
     
     logger = logging.getLogger()
  
-    # Do initial evaluation
-    if algo_type == "dgpi":
-        model.evaluate_policy()
+
  
     try:
         model.learn(
